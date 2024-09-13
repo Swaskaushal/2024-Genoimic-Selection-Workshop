@@ -1,0 +1,167 @@
+
+## Introduction
+#In this R script, we implement various genomic prediction models such as G-BLUP, Bayesian Ridge Regression (BRR), LASSO, and BayesB. We will estimate variance components, calculate heritability, and assess the prediction accuracy of each model using cross-validation.
+  
+# Data Preparation
+
+# Load libraries
+library(BGLR)   # For Bayesian models and genomic prediction
+library(rrBLUP) # For G-BLUP (Genomic Best Linear Unbiased Prediction) model
+
+
+# Load data
+data(wheat)
+X <- wheat.X # Genotype data (markers)
+Y <- wheat.Y # Phenotype data (e.g., yield for different environments)
+
+# Select a single environment. For instance, environment 2
+y <- Y[,2]
+
+n <- nrow(Y) # Number of individuals
+p <- ncol(X) # Number of markers (SNPs)
+
+# Genomic relationship matrix
+M <- scale(X)
+G <- tcrossprod(M)/p # Genomic relationship matrix (G)
+
+# Design matrix for individuals. In this case is a diagonal since there are no replicates
+GID <- factor(rownames(Y),levels=rownames(Y))
+Zg <- model.matrix(~GID-1)
+
+
+# Variance components estimation: After running the 'data preparation' part, the code following code can be used to fit all models and to extract variance components and other parameters.
+
+
+set.seed(123)
+
+# Matrix to store results. It will save the main parameters for each model
+outVAR <- matrix(NA,nrow=6,ncol=5)
+dimnames(outVAR) <- list(c("varU","varE","lambda","dfb","Sb","H2"),c("GBLUP1","GBLUP2","BRR","LASSO","BayesB"))
+
+# Number of iterations and burn-in for Bayesian models
+nIter <- 30000
+burnIn <- 5000
+
+# G-BLUP model using 'rrBLUP' package
+fm <- mixed.solve(y=y,Z=Zg,K=G) 
+outVAR[1,1] <- fm$Vu
+outVAR[2,1] <- fm$Ve
+outVAR[6,1] <- fm$Vu/(fm$Vu+fm$Ve)    # Heritability
+
+# G-BLUP model using 'BGLR' package. Model RKHS with K=G
+fm <- BGLR(y,ETA=list(list(K=G,model="RKHS")),nIter=nIter,burnIn=burnIn)
+outVAR[1,2] <- fm$ETA[[1]]$varU
+outVAR[2,2] <- fm$varE
+outVAR[6,2] <- outVAR[1,2]/(outVAR[1,2] + outVAR[2,2])  # Heritability
+
+# Bayesian Ridge Regression (BRR) using 'BGLR' package
+fm <- BGLR(y,ETA=list(list(X=M,model="BRR")),nIter=nIter,burnIn=burnIn)
+outVAR[1,3] <- fm$ETA[[1]]$varB*p    # Multiply by p to obtain the right varU as in G-BLUP
+outVAR[2,3] <- fm$varE
+outVAR[6,3] <- outVAR[1,3]/(outVAR[1,3] + outVAR[2,3])  # Heritability
+
+# Bayesian LASSO model using 'BGLR' package
+fm <- BGLR(y,ETA=list(list(X=M,model="BL")),nIter=nIter,burnIn=burnIn)
+outVAR[2,4] <- fm$varE
+outVAR[3,4] <- fm$ETA[[1]]$lambda
+
+# Bayes B model using 'BGLR' package
+fm <- BGLR(y,ETA=list(list(X=M,model="BayesB")),nIter=nIter,burnIn=burnIn)
+outVAR[2,5] <- fm$varE
+outVAR[4,5] <- fm$ETA[[1]]$df0
+outVAR[5,5] <- fm$ETA[[1]]$S0
+
+print(outVAR)
+
+models <- c("GBLUP","BRR","LASSO","BayesB")
+
+#Replicates of partitions to obtain standard deviations of predictions
+
+# Models
+models <- c("GBLUP","BRR","LASSO","BayesB")
+
+#==================================================
+# User specifications
+#==================================================
+# Choose the percentage of the data assigned to Testing set
+percTST <- 0.3
+
+# Number of replicates
+m <- 10
+
+# Number of iterations and burn-in for Bayesian models
+nIter <- 12000
+burnIn <- 2000
+
+#==================================================
+# Create seed for repeated randomizations
+set.seed(123)
+seeds <- round(seq(1E3, 1E6, length = m))
+
+# Number of test samples
+nTST <- round(percTST * n)
+
+# Loop over all models
+models <- c("GBLUP", "BRR", "LASSO", "BayesB")
+for(mod in seq_along(models)) {
+  model <- models[mod]
+  
+  # Matrix to store correlations for each partition
+  outCOR <- matrix(NA, nrow = m, ncol = 1)
+  colnames(outCOR) <- model
+  
+  # Replicates for random partitions
+  for(k in 1:m) {
+    set.seed(seeds[k])
+    indexTST <- sample(1:n, size = nTST, replace = FALSE)
+    yNA <- y
+    yNA[indexTST] <- NA
+    
+    # Select the ETA model based on current model
+    if(model == "GBLUP")  ETA <- list(list(K = G, model = "RKHS"))
+    if(model == "BRR")    ETA <- list(list(X = M, model = "BRR"))
+    if(model == "LASSO")  ETA <- list(list(X = M, model = "BL"))
+    if(model == "BayesB") ETA <- list(list(X = M, model = "BayesB"))
+    
+    # Fit the model
+    fm <- BGLR(yNA, ETA = ETA, nIter = nIter, burnIn = burnIn)
+    
+    # Store the correlation for the current replicate
+    outCOR[k, 1] <- cor(fm$yHat[indexTST], y[indexTST])
+  }
+  
+  # Save results for the current model
+  save(outCOR, file = paste0("outCOR_", model, ".RData"))
+}
+
+#Results
+# Now, load the results for all models
+OUT <- NULL
+for(mod in seq_along(models)) {
+  filename <- paste0("outCOR_", models[mod], ".RData")    
+  if(file.exists(filename)) {
+    load(filename, verbose = TRUE)
+    
+    # Append results to OUT matrix
+    OUT <- cbind(OUT, outCOR)
+  } else {
+    warning(paste("File not found:", filename))
+  }
+}
+
+# Set column names of OUT to model names
+colnames(OUT) <- models
+
+# Calculate mean and standard deviation for each model
+mean_sd <- round(rbind(Mean = apply(OUT, 2, mean), SD = apply(OUT, 2, sd)), 4)
+print(mean_sd)
+
+# Define a set of colors for the boxplot
+box_colors <- c("skyblue", "lightgreen", "salmon", "lightpink")
+
+# Create boxplot of accuracies across models with colors
+boxplot(OUT, 
+        ylab = "Accuracy", 
+        xlab = "Model", 
+        names = models, 
+        col = box_colors)  # Add color to each box
